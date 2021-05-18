@@ -17,7 +17,7 @@ Logging... TODO
 """
 
 from .robotinterface import *
-from ..math import vectorops,so3,se3,spline
+from ..math import vectorops,so2,so3,se3,spline
 from ..plan import motionplanning
 from ..model.trajectory import Trajectory,HermiteTrajectory
 from .cartesian_drive import CartesianDriveSolver
@@ -292,7 +292,7 @@ class RobotInterfaceCompleter(RobotInterfaceBase):
             self._emulator.updateCommand(qcmd,vcmd,tcmd)
         if not self._has['controlRate']:
             self._emulator.pendingClock = self.clock()
-            if self._emulator.lastClock != self._emulator.pendingClock:
+            if self._emulator.lastClock is not None and self._emulator.lastClock != self._emulator.pendingClock:
                 self._emulator.dt = self._emulator.pendingClock - self._emulator.lastClock
         elif not self._has['clock']:
             self._emulator.dt = self.controlRate()
@@ -1035,6 +1035,7 @@ class _JointInterfaceEmulatorData:
         self.commandedVelocity = None
         self.commandedTorque = None
         self.commandTTL = None
+        self.continuousRotation = False
         self.lastCommandedPosition = None
         self.commandParametersChanged = False
         self.pidCmd = None
@@ -1045,12 +1046,18 @@ class _JointInterfaceEmulatorData:
         self.trajectoryVelocities = None
         self.externalController = None
 
+    def _positionDifference(self,a,b):
+        if self.continuousRotation:
+            return so2.diff(a,b)
+        else:
+            return a-b
+
     def update(self,t,q,v,dt):
         if v is None:
             if self.sensedPosition is None:
                 self.sensedVelocity = 0
             else:
-                self.sensedVelocity = (q-self.sensedPosition)/dt
+                self.sensedVelocity = self._positionDifference(q,self.sensedPosition)/dt
             v = self.sensedVelocity
         else:
             self.sensedVelocity = v
@@ -1064,7 +1071,7 @@ class _JointInterfaceEmulatorData:
             self.commandedPosition = self.pidCmd[0]
             self.commandedVelocity = self.pidCmd[1]
             self.commandedTorque = self.pidCmd[2]
-            self.pidIntegralError += (self.commandedPosition-q)*dt
+            self.pidIntegralError += self._positionDifference(self.commandedPosition,q)*dt
             self.commandTTL = dt*5
         elif self.controlMode == 'pwl' or self.controlMode == 'pwc':
             self.commandedPosition,self.commandedVelocity = self.evalTrajectory(t)
@@ -1115,7 +1122,7 @@ class _JointInterfaceEmulatorData:
                 #construct interpolant... should we do it in 1 time step or stretch it out?
                 if self.commandedVelocity == 0:
                     return [0],[self.commandedPosition]
-                dt = (self.commandedPosition - self.lastCommandedPosition)/self.commandedVelocity
+                dt = self.positionDifference(self.commandedPosition,self.lastCommandedPosition)/self.commandedVelocity
                 return [dt],[self.commandedPosition]
             elif self.controlMode == 'v':
                 #construct interpolant
@@ -1130,7 +1137,7 @@ class _JointInterfaceEmulatorData:
                     raise RuntimeError("Can't emulate PID control for joint {} using torque control, no gains are set".format(self.name))
                 qdes,vdes,tdes = self.pidCmd
                 kp,ki,kd = self.pidGains
-                t_pid = kp*(qdes-self.sensedPosition) + kd*(vdes-self.sensedVelocity) + ki*self.pidIntegralError + tdes
+                t_pid = kp*self._positionDifference(qdes,self.sensedPosition) + kd*(vdes-self.sensedVelocity) + ki*self.pidIntegralError + tdes
                 #if abs(self.pidIntegralError[i]*ki) > tmax:
                 #cap integral error to prevent wind-up
                 return t_pid,self.commandTTL
@@ -1140,7 +1147,15 @@ class _JointInterfaceEmulatorData:
         elif commandType == 'p' or commandType == 'm':
             return self.commandedPosition,
         elif commandType == 'v':
-            return self.commandedVelocity,self.commandTTL
+            assert self.controlMode != 'pid',"Can't emulate PID control mode with velocity control"
+            if self.controlMode == 'v':
+                return self.commandedVelocity,self.commandTTL
+            else:
+                #TODO: make these tunable per-joint?
+                kFeedforward = 0.8
+                kTrack = 1.0
+                vel = kFeedforward*self.commandedVelocity + kTrack*self._positionDifference(self.commandedPosition,self.sensedPosition)
+                return vel,self.commandTTL
 
     def promote(self,controlType):
         if self.controlMode == controlType:
@@ -1236,7 +1251,7 @@ class _JointInterfaceEmulatorData:
         dt = self.trajectoryTimes[i+1]-self.trajectoryTimes[i]
         if self.trajectoryVelocities is None:
             #piecewise linear
-            dp = self.trajectoryMilestones[i+1]-self.trajectoryMilestones[i]
+            dp = self._positionDifference(self.trajectoryMilestones[i+1],self.trajectoryMilestones[i])
             pos = self.trajectoryMilestones[i] + u*dp
             if dt == 0:
                 #discontinuity?
@@ -1249,6 +1264,7 @@ class _JointInterfaceEmulatorData:
             assert len(self.trajectoryTimes) == len(self.trajectoryVelocities)
             x1,v1 = [self.trajectoryMilestones[i]],[self.trajectoryVelocities[i]*dt]
             x2,v2 = [self.trajectoryMilestones[i+1]],[self.trajectoryVelocities[i+1]*dt]
+            x2[0] = x1[0] + self._positionDifference(x2[0],x1[0])  #handle continuous rotation joints
             x = spline.hermite_eval(x1,v1,x2,v2,u)
             dx = vectorops.mul(spline.hermite_deriv(x1,v1,x2,v2,u),1.0/dt)
             return x[0],dx[0]
@@ -1456,6 +1472,15 @@ class _RobotInterfaceEmulatorData:
         self.lastClock = None
         self.dt = None
         self.jointData = [_JointInterfaceEmulatorData('Joint '+str(i)) for i in range(nd)]
+        if klamptModel is not None:
+            #find any continuous rotation joints
+            for i in range(nd):
+                d = klamptModel.driver(i)
+                if len(d.getAffectedLinks())==1:
+                    link = d.getAffectedLinks()[0]
+                    if klamptModel.getJointType(link)=='spin':
+                        #print("_RobotInterfaceEmulatorData: Interpreting joint",i," as a spin joint")
+                        self.jointData[i].continuousRotation = True
         self.cartesianInterfaces = dict()
         self.commandSent = False
 
@@ -1635,6 +1660,20 @@ class _RobotInterfaceEmulatorData:
             assert all(v >= 0 for v in amax)
             qcmd = [(self.jointData[i].commandedPosition if self.jointData[i].commandedPosition is not None else self.jointData[i].sensedPosition) for i in indices]
             dqcmd = [(self.jointData[i].commandedVelocity if self.jointData[i].commandedVelocity is not None else self.jointData[i].sensedVelocity) for i in indices]
+            #handle continuous rotations...
+            if any(self.jointData[j].continuousRotation for j in indices):
+                q = q[:]
+                for i,j in enumerate(indices):
+                    if self.jointData[j].continuousRotation:
+                        q[i] = qcmd[i] + self.jointData[j]._positionDifference(q[i],qcmd[i])
+            for i in range(len(dqcmd)):
+                if qcmd[i] < xmin[i]:
+                    xmin[i] = qcmd[i]
+                if qcmd[i] > xmax[i]:
+                    xmax[i] = qcmd[i]
+                    #TODO: warn if this is way out of bounds
+                if abs(dqcmd[i]) > vmax[i]:
+                    vmax[i] = dqcmd[i]
             try:
                 ts,xs,vs = motionplanning.interpolateNDMinTime(qcmd,dqcmd,q,[0]*len(q),xmin,xmax,vmax,amax)
             except Exception as e:
@@ -1650,8 +1689,6 @@ class _RobotInterfaceEmulatorData:
                 raise
             ts,xs,vs = motionplanning.combineNDCubic(ts,xs,vs)
             self.setPiecewiseCubic(indices,ts,xs,vs,True)
-            #t = max(abs(qi-qi0)/vimax for (qi,qi0,vimax) in zip(q,qcmd,vmax))
-            #self.setPiecewiseLinear(indices,[t],[q],True)
 
     def setVelocity(self,indices,v,ttl):
         """Backup: runs a velocity command for ttl seconds using a piecewise linear

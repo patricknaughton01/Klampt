@@ -2535,7 +2535,7 @@ bool Robot::LoadURDF(const char* fn)
   //      mounts a geometry or another URDF / .rob file to a link.
   double default_mass = 0.0001;
   Matrix3 default_inertia; default_inertia.setIdentity(); default_inertia *= 1e-8;  
-  double default_acc_max = 100;
+  double default_acc_max = 10;
   int freezeRootLink = 0;
   string worldFrame = "world";
   vector<pair<string, string> > selfCollision;
@@ -3177,28 +3177,18 @@ bool Robot::LoadURDF(const char* fn)
         }
       }
     }
-    if(!linkNode->geomData.empty()) {
-      //load from string
-      stringstream ss(linkNode->geomData);
-      Geometry::AnyGeometry3D geom;
-      if(!geom.Load(ss)) {
-        LOG4CXX_ERROR(GET_LOGGER(URDFParser), "Could not load primitive geometry from data" << linkNode->geomData);
-        //TEMP
-        LOG4CXX_INFO(GET_LOGGER(URDFParser), "Temporarily ignoring error...");
-      }
-      else {
-        if(link_index >= (int)geomManagers.size())
-          geomManagers.resize(geometry.size());
-        //*geomManagers[link_index] = geom;
-        //TEMP: convert primitives to mesh?
-        Geometry::AnyGeometry3D meshGeom;
-        geom.Convert(Geometry::AnyGeometry3D::TriangleMesh,meshGeom,0.01);
-        geomManagers[link_index].CreateEmpty();
-        *geomManagers[link_index] = meshGeom;
-        //make the default appearance be grey
-        SetDefaultAppearance(geomManagers[link_index].Appearance());
-        geometry[link_index] = geomManagers[link_index];
-      }
+    if(!linkNode->geomData.Empty()) {
+      if(link_index >= (int)geomManagers.size())
+        geomManagers.resize(geometry.size());
+      //*geomManagers[link_index] = geom;
+      //TEMP: convert primitives to mesh?
+      Geometry::AnyGeometry3D meshGeom;
+      linkNode->geomData.Convert(Geometry::AnyGeometry3D::TriangleMesh,meshGeom,0.01);
+      geomManagers[link_index].CreateEmpty();
+      *geomManagers[link_index] = meshGeom;
+      //make the default appearance be grey
+      SetDefaultAppearance(geomManagers[link_index].Appearance());
+      geometry[link_index] = geomManagers[link_index];
     }
     if(this->geometry[link_index]) {
       //LOG4CXX_INFO(GET_LOGGER(URDFParser),"Geometry "<<geomFiles[link_index]<<" has "<<this->geometry[link_index]->NumElements()<<" triangles");

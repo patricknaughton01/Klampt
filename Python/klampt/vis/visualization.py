@@ -990,7 +990,8 @@ def run(plugin=None):
     """
     global _window_manager
     _init()
-    setPlugin(plugin)
+    if plugin is not None:
+        setPlugin(plugin)
     _window_manager.run()
     kill()
 
@@ -2069,6 +2070,8 @@ def drawTrajectory(traj,width,color,pointSize=None,pointColor=None):
     """
     if GL is None: raise RuntimeError("OpenGL not initialized?")
     if isinstance(traj,list):
+        if len(traj)==0:
+            return
         if pointSize is None:
             pointSize = width+2
         if pointColor is None:
